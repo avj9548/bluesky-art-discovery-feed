@@ -7,6 +7,43 @@ from atproto.exceptions import FirehoseError
 from server.database import SubscriptionState
 from server.logger import logger
 
+# === AUTO BACKFILL ON STARTUP ===   ←←← PASTE RIGHT HERE
+from server.data_filter import CORE_ARTISTS_DIDS, EXTENDED_ARTISTS, MAX_EXTENDED
+from atproto import Client
+from dotenv import load_dotenv
+import os
+import time
+
+load_dotenv()
+
+def run_startup_backfill():
+    """Run backfill when the server starts"""
+    logger.info("🚀 Running automatic startup backfill...")
+    
+    client = Client()
+    try:
+        client.login(os.getenv("HANDLE"), os.getenv("PASSWORD"))
+    except:
+        logger.warning("Could not log in for backfill")
+        return
+
+    added = 0
+    for did in list(CORE_ARTISTS_DIDS):
+        try:
+            resp = client.app.bsky.feed.get_actor_likes(params={'actor': did, 'limit': 30})
+            for item in resp.likes:
+                if hasattr(item.subject, 'uri'):
+                    liked_did = item.subject.uri.split('/')[2]
+                    if liked_did not in CORE_ARTISTS_DIDS and liked_did not in EXTENDED_ARTISTS and len(EXTENDED_ARTISTS) < MAX_EXTENDED:
+                        EXTENDED_ARTISTS.add(liked_did)
+                        added += 1
+        except:
+            pass
+
+        time.sleep(1.5)
+
+    logger.info(f"✅ Startup backfill complete. Added {added} extended artists. Total: {len(EXTENDED_ARTISTS)}")
+
 _INTERESTED_RECORDS = {
     models.AppBskyFeedLike: models.ids.AppBskyFeedLike,
     models.AppBskyFeedPost: models.ids.AppBskyFeedPost,
