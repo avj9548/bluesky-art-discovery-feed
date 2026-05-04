@@ -20,6 +20,7 @@ CORE_ARTISTS_HANDLES = {
 resolver = None
 CORE_ARTISTS_DIDS = set()
 EXTENDED_ARTISTS = set()
+MAX_EXTENDED = 300 
 
 def init_core():
     global resolver
