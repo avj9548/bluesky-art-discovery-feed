@@ -1,98 +1,129 @@
-import datetime
-
 from collections import defaultdict
+import time
 
-from atproto import models
+from atproto import models, IdResolver
 
 from server import config
 from server.logger import logger
 from server.database import db, Post
 
 
-def is_archive_post(record: 'models.AppBskyFeedPost.Record') -> bool:
-    # Sometimes users will import old posts from Twitter/X which con flood a feed with
-    # old posts. Unfortunately, the only way to test for this is to look an old
-    # created_at date. However, there are other reasons why a post might have an old
-    # date, such as firehose or firehose consumer outages. It is up to you, the feed
-    # creator to weigh the pros and cons, amd and optionally include this function in
-    # your filter conditions, and adjust the threshold to your liking.
-    #
-    # See https://github.com/MarshalX/bluesky-feed-generator/pull/21
+# === YOUR CORE ARTISTS ===
+CORE_ARTISTS_HANDLES = {
+    "jamzenn.bsky.social",
+    "foxovh.bsky.social",
+    "ekzonzz.bsky.social",
+    "ulvinart.bsky.social",
+    "foxer421.bsky.social",
+    "bonfiredemon.bsky.social",
+    "chunie.bsky.social",
+    "x6udpngx.bsky.social",
+    "kalahari.bsky.social",
+    "marcknelsen.bsky.social",
+    "mokejumps.bsky.social",
+    "bubblewolf.bsky.social",
+}
 
-    archived_threshold = datetime.timedelta(days=1)
-    created_at = datetime.datetime.fromisoformat(record.created_at)
-    now = datetime.datetime.now(datetime.UTC)
+# Resolve handles → DIDs at startup
+logger.info("🔄 Resolving core artist handles to DIDs...")
+resolver = IdResolver()
+CORE_ARTISTS_DIDS = set()
+for handle in CORE_ARTISTS_HANDLES:
+    try:
+        did = resolver.handle.resolve(handle)
+        CORE_ARTISTS_DIDS.add(did)
+        logger.info(f"✅ Resolved {handle} → {did}")
+    except Exception as e:
+        logger.warning(f"⚠️ Could not resolve {handle}: {e}")
+logger.info(f"Loaded {len(CORE_ARTISTS_DIDS)} core artists")
 
-    return now - created_at > archived_threshold
+
+# Extended artists (people your core artists engage with)
+EXTENDED_ARTISTS = set()
+MAX_EXTENDED = 200   # Limit to prevent it growing too big
 
 
-def should_ignore_post(created_post: dict) -> bool:
-    record = created_post['record']
-    uri = created_post['uri']
-
-    if config.IGNORE_ARCHIVED_POSTS and is_archive_post(record):
-        logger.debug(f'Ignoring archived post: {uri}')
+def is_art_post(record: 'models.AppBskyFeedPost.Record') -> bool:
+    """Strict filter: original posts with images/video only"""
+    if record.reply:  # No replies
+        return False
+    if isinstance(record.embed, models.AppBskyEmbedImages.Main):
         return True
-
-    if config.IGNORE_REPLY_POSTS and record.reply:
-        logger.debug(f'Ignoring reply post: {uri}')
+    if isinstance(record.embed, models.AppBskyEmbedVideo.Main):
         return True
-
     return False
 
 
 def operations_callback(ops: defaultdict) -> None:
-    # Here we can filter, process, run ML classification, etc.
-    # After our feed alg we can save posts into our DB
-    # Also, we should process deleted posts to remove them from our DB and keep it in sync
-
-    # for example, let's create our custom feed that will contain all posts that contains 'python' related text
-
     posts_to_create = []
+    
+    # === Handle new posts ===
     for created_post in ops[models.ids.AppBskyFeedPost]['created']:
-        author = created_post['author']
+        author_did = created_post['author']
         record = created_post['record']
+        uri = created_post['uri']
 
-        post_with_images = isinstance(record.embed, models.AppBskyEmbedImages.Main)
-        post_with_video = isinstance(record.embed, models.AppBskyEmbedVideo.Main)
-        inlined_text = record.text.replace('\n', ' ')
+        # Core artist original art
+        if author_did in CORE_ARTISTS_DIDS:
+            if is_art_post(record):
+                posts_to_create.append({
+                    'uri': uri,
+                    'cid': created_post['cid'],
+                    'reply_parent': None,
+                    'reply_root': None,
+                })
+                logger.info(f"✅ Core art: {author_did}")
 
-        # print all texts just as demo that data stream works
-        logger.debug(
-            f'NEW POST '
-            f'[CREATED_AT={record.created_at}]'
-            f'[AUTHOR={author}]'
-            f'[WITH_IMAGE={post_with_images}]'
-            f'[WITH_VIDEO={post_with_video}]'
-            f': {inlined_text}'
-        )
+        # Extended artist original art
+        elif author_did in EXTENDED_ARTISTS:
+            if is_art_post(record):
+                posts_to_create.append({
+                    'uri': uri,
+                    'cid': created_post['cid'],
+                    'reply_parent': None,
+                    'reply_root': None,
+                })
+                logger.info(f"🌟 Extended art: {author_did}")
 
-        if should_ignore_post(created_post):
-            continue
+    # === Discover extended artists via likes & reposts ===
+    for like in ops[models.ids.AppBskyFeedLike]['created']:
+        liker_did = like['author']
+        if liker_did in CORE_ARTISTS_DIDS:
+            # Get the author of the liked post
+            subject = like['record'].subject
+            if isinstance(subject, models.ComAtprotoRepoStrongRef.Main):
+                liked_author = subject.uri.split('/')[2]  # extract DID
+                if liked_author not in CORE_ARTISTS_DIDS and len(EXTENDED_ARTISTS) < MAX_EXTENDED:
+                    EXTENDED_ARTISTS.add(liked_author)
+                    logger.info(f"➕ Added extended artist via like: {liked_author}")
 
-        # only python-related posts
-        if 'python' in record.text.lower():
-            reply_root = reply_parent = None
-            if record.reply:
-                reply_root = record.reply.root.uri
-                reply_parent = record.reply.parent.uri
+    for repost in ops[models.ids.AppBskyFeedRepost]['created']:
+        reposter_did = repost['author']
+        if reposter_did in CORE_ARTISTS_DIDS:
+            subject = repost['record'].subject
+            if isinstance(subject, models.ComAtprotoRepoStrongRef.Main):
+                reposted_author = subject.uri.split('/')[2]
+                if reposted_author not in CORE_ARTISTS_DIDS and len(EXTENDED_ARTISTS) < MAX_EXTENDED:
+                    EXTENDED_ARTISTS.add(reposted_author)
+                    logger.info(f"➕ Added extended artist via repost: {reposted_author}")
 
-            post_dict = {
-                'uri': created_post['uri'],
-                'cid': created_post['cid'],
-                'reply_parent': reply_parent,
-                'reply_root': reply_root,
-            }
-            posts_to_create.append(post_dict)
-
-    posts_to_delete = ops[models.ids.AppBskyFeedPost]['deleted']
-    if posts_to_delete:
-        post_uris_to_delete = [post['uri'] for post in posts_to_delete]
-        Post.delete().where(Post.uri.in_(post_uris_to_delete)).execute()
-        logger.debug(f'Deleted from feed: {len(post_uris_to_delete)}')
-
+    # Save posts
     if posts_to_create:
         with db.atomic():
-            for post_dict in posts_to_create:
-                Post.create(**post_dict)
-        logger.debug(f'Added to feed: {len(posts_to_create)}')
+            for p in posts_to_create:
+                Post.create(**p)
+        logger.info(f'📥 Added {len(posts_to_create)} art posts to feed')
+
+    # Clean deleted posts
+    for deleted in ops[models.ids.AppBskyFeedPost]['deleted']:
+        Post.delete().where(Post.uri == deleted['uri']).execute()
+
+
+# Reduce cursor spam
+last_log_time = 0
+def on_cursor_updated(cursor: int) -> None:
+    global last_log_time
+    now = time.time()
+    if now - last_log_time > 60:
+        logger.debug(f"Cursor: {cursor}")
+        last_log_time = now
