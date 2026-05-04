@@ -1,28 +1,14 @@
-from datetime import datetime
+import os
+from peewee import SqliteDatabase
 
-import peewee
+# Use WAL mode for better concurrency
+db_path = 'feed.db'
+db = SqliteDatabase(db_path, pragmas={
+    'journal_mode': 'wal',      # This is the key fix
+    'cache_size': -1024 * 64,   # 64MB cache
+    'synchronous': 0,
+})
 
-db = peewee.SqliteDatabase('feed_database.db')
-
-
-class BaseModel(peewee.Model):
-    class Meta:
-        database = db
-
-
-class Post(BaseModel):
-    uri = peewee.CharField(index=True)
-    cid = peewee.CharField()
-    reply_parent = peewee.CharField(null=True, default=None)
-    reply_root = peewee.CharField(null=True, default=None)
-    indexed_at = peewee.DateTimeField(default=datetime.utcnow)
-
-
-class SubscriptionState(BaseModel):
-    service = peewee.CharField(unique=True)
-    cursor = peewee.BigIntegerField()
-
-
-if db.is_closed():
-    db.connect()
-    db.create_tables([Post, SubscriptionState])
+def init_db():
+    from server.models import Post  # noqa
+    db.create_tables([Post], safe=True)
