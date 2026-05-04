@@ -88,3 +88,6 @@ def get_feed_skeleton():
         return 'Malformed cursor', 400
 
     return jsonify(body)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
